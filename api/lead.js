@@ -1,64 +1,88 @@
-// /api/lead.js — Vercel Serverless Function for Zoho Tables
+// /api/lead.js — Auto-map Zoho Tables fields by column name (with CORS)
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  // CORS (relax now; we can restrict to your domain later)
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
   const {
-    ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN,
-    ZOHO_TABLES_BASE_ID, ZOHO_TABLES_TABLE_ID, ZOHO_TABLES_VIEW_ID,
-    ZOHO_DC = 'us',
-    ZOHO_FIELD_FIRST_NAME, ZOHO_FIELD_LAST_NAME, ZOHO_FIELD_PHONE,
-    ZOHO_FIELD_EMAIL, ZOHO_FIELD_ZIP, ZOHO_FIELD_SERVICE,
-    ZOHO_FIELD_DETAILS, ZOHO_FIELD_PAGE, ZOHO_FIELD_ROUTE, ZOHO_FIELD_TS,
+    ZOHO_CLIENT_ID,
+    ZOHO_CLIENT_SECRET,
+    ZOHO_REFRESH_TOKEN,
+    ZOHO_TABLES_BASE_ID,
+    ZOHO_TABLES_TABLE_ID,
+    ZOHO_TABLES_VIEW_ID,
+    ZOHO_DC = "us",
+    DEFAULT_LEAD_SOURCE = "Website",
   } = process.env;
 
   try {
-    // 1) OAuth access token from refresh token
-    const authURL = `https://accounts.zoho.${ZOHO_DC}/oauth/v2/token` +
+    // 1) Access token from refresh token
+    const authURL =
+      `https://accounts.zoho.${ZOHO_DC}/oauth/v2/token` +
       `?refresh_token=${encodeURIComponent(ZOHO_REFRESH_TOKEN)}` +
       `&client_id=${encodeURIComponent(ZOHO_CLIENT_ID)}` +
       `&client_secret=${encodeURIComponent(ZOHO_CLIENT_SECRET)}` +
       `&grant_type=refresh_token`;
-
-    const tokRes = await fetch(authURL, { method: 'POST' });
+    const tokRes = await fetch(authURL, { method: "POST" });
     const tok = await tokRes.json();
     if (!tok.access_token) throw new Error(`Token error: ${tokRes.status} ${JSON.stringify(tok)}`);
+    const authHeader = { Authorization: `Zoho-oauthtoken ${tok.access_token}` };
 
-    // 2) Map incoming fields -> Zoho Tables field IDs
-    const b = req.body || {};
-    const map = {
-      [ZOHO_FIELD_FIRST_NAME]: b.firstName || '',
-      [ZOHO_FIELD_LAST_NAME]:  b.lastName  || '',
-      [ZOHO_FIELD_PHONE]:      b.phone     || '',
-      [ZOHO_FIELD_EMAIL]:      b.email     || '',
-      [ZOHO_FIELD_ZIP]:        b.zip       || '',
-      [ZOHO_FIELD_SERVICE]:    b.service   || '',
-      [ZOHO_FIELD_DETAILS]:    b.details   || '',
-      [ZOHO_FIELD_PAGE]:       b.page      || '',
-      [ZOHO_FIELD_ROUTE]:      b.route     || '',
-      [ZOHO_FIELD_TS]:         b.ts || new Date().toISOString(),
+    // 2) Fetch field list for this table
+    const fieldsURL =
+      `https://tables.zoho.com/api/v1/fields?base_id=${encodeURIComponent(ZOHO_TABLES_BASE_ID)}` +
+      `&table_id=${encodeURIComponent(ZOHO_TABLES_TABLE_ID)}` +
+      (ZOHO_TABLES_VIEW_ID ? `&view_id=${encodeURIComponent(ZOHO_TABLES_VIEW_ID)}` : "");
+    const fRes = await fetch(fieldsURL, { headers: authHeader });
+    const fJson = await fRes.json();
+    if (!fRes.ok) throw new Error(`Fields error: ${fRes.status} ${JSON.stringify(fJson)}`);
+
+    const fields = Array.isArray(fJson.fields) ? fJson.fields : fJson; // be tolerant of shapes
+    const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    // Build a map { normalizedColumnName -> fieldID }
+    const idByNormName = {};
+    for (const f of fields) {
+      const namesToTry = [
+        f.display_name,
+        f.column_name,
+        f.name,
+        f.field_name,
+        f.label,
+      ].filter(Boolean);
+      for (const n of namesToTry) idByNormName[norm(n)] = f.fieldID || f.field_id || f.id;
+    }
+
+    // Helper to find a field by any of several aliases
+    const pick = (...aliases) => {
+      for (const a of aliases) {
+        const fid = idByNormName[norm(a)];
+        if (fid) return fid;
+      }
+      // also try contains search
+      for (const key of Object.keys(idByNormName)) {
+        if (aliases.some((a) => key.includes(norm(a)))) return idByNormName[key];
+      }
+      return null;
     };
-    const field_ids_with_values = Object.fromEntries(Object.entries(map).filter(([k]) => !!k));
 
-    // 3) Create record in Zoho Tables
-    const body = new URLSearchParams({
-      base_id: ZOHO_TABLES_BASE_ID,
-      table_id: ZOHO_TABLES_TABLE_ID,
-      ...(ZOHO_TABLES_VIEW_ID ? { view_id: ZOHO_TABLES_VIEW_ID } : {}),
-      field_ids_with_values: JSON.stringify(field_ids_with_values),
-    });
+    // 3) Build payload from request body
+    const b = (await parseJSON(req)) || {};
+    const fullName = [b.firstName, b.lastName].filter(Boolean).join(" ").trim() || b.name || "";
 
-    const zRes = await fetch('https://tables.zoho.com/api/v1/records', {
-      method: 'POST',
-      headers: { Authorization: `Zoho-oauthtoken ${tok.access_token}` },
-      body,
-    });
+    // Known columns in your screenshot
+    const fidLeadName   = pick("Lead Name", "Name", "Full Name");
+    const fidLeadPhone  = pick("Lead Number", "Phone", "Phone Number", "Mobile");
+    const fidLeadEmail  = pick("Lead Email ID", "Email", "Email Address");
+    const fidLeadSource = pick("Lead Source", "Source");
 
-    const out = await zRes.json();
-    if (!zRes.ok) throw new Error(`Zoho error: ${zRes.status} ${JSON.stringify(out)}`);
+    // Optional columns if you add them later
+    const fidZip     = pick("ZIP", "Zip Code", "Postal Code");
+    const fidService = pick("Service", "Requested Service");
+    const fidDetails = pick("Details", "Notes", "Message");
+    const fidPage    = pick("Page", "Page URL", "URL");
+    const fidRoute   = pick("Route", "
 
-    res.status(200).json({ ok: true, out });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: String(err) });
-  }
-}
